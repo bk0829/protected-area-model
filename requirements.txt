@@ -2,3 +2,4 @@ streamlit>=1.38
 numpy>=1.26
 pandas>=2.1
 Pillow>=10.0
+matplotlib>=3.8

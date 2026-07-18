@@ -62,6 +62,45 @@ def species_value(area: int, c: float, k: float) -> float:
     return float(c * (area ** k))
 
 
+
+
+def equal_allocation(
+    matrix: np.ndarray,
+    budget_cells: int,
+    params: Dict[int, Dict[str, float]],
+) -> Tuple[Dict[int, int], float]:
+    """
+    같은 총 보호면적을 산림·습지·초지에 최대한 균등하게 배분한 비교값을 계산한다.
+    각 지형에 실제로 존재하는 셀 수를 초과하지 않는다.
+    """
+    available = {h: int(np.sum(matrix == h)) for h in (1, 2, 3)}
+    allocation = {1: 0, 2: 0, 3: 0}
+    remaining = min(int(budget_cells), sum(available.values()))
+
+    while remaining > 0:
+        changed = False
+
+        for habitat in (1, 2, 3):
+            if remaining > 0 and allocation[habitat] < available[habitat]:
+                allocation[habitat] += 1
+                remaining -= 1
+                changed = True
+
+        if not changed:
+            break
+
+    value = sum(
+        species_value(
+            allocation[habitat],
+            params[habitat]["c"],
+            params[habitat]["k"],
+        )
+        for habitat in (1, 2, 3)
+    )
+
+    return allocation, value
+
+
 def optimize_allocation(
     matrix: np.ndarray,
     budget_cells: int,

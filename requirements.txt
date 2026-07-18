@@ -4,4 +4,3 @@ pandas>=2.1
 Pillow>=10.0
 matplotlib>=3.8
 scikit-learn>=1.4
-

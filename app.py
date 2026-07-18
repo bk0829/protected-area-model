@@ -4,22 +4,21 @@ from __future__ import annotations
 from io import BytesIO
 from typing import Dict, List, Tuple
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image, ImageDraw
-from sklearn.cluster import KMeans
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import StandardScaler
 
 
 st.set_page_config(
-    page_title="보호구역 자동 추천 시스템 5.0",
+    page_title="보호구역 자동 추천 시스템 2.0",
     page_icon="🌿",
     layout="wide",
 )
 
+# =========================================================
+# 기본 설정
+# =========================================================
 HABITAT_LABELS = {
     0: "개발지역·도로",
     1: "산림",
@@ -28,10 +27,10 @@ HABITAT_LABELS = {
 }
 
 HABITAT_COLORS = {
-    0: (150, 150, 150, 125),
-    1: (25, 155, 70, 135),
-    2: (30, 120, 225, 140),
-    3: (235, 190, 35, 135),
+    0: (165, 165, 165, 125),
+    1: (30, 155, 75, 135),
+    2: (35, 125, 225, 140),
+    3: (235, 190, 45, 135),
 }
 
 DEFAULT_PARAMS = {
@@ -40,9 +39,22 @@ DEFAULT_PARAMS = {
     3: {"c": 8.0, "k": 0.28},
 }
 
+EXAMPLE_MATRIX = np.array([
+    [1,1,1,1,1,1,2,0,3,3],
+    [1,1,1,1,1,1,2,0,3,3],
+    [1,1,1,1,1,3,2,0,3,3],
+    [1,1,1,1,3,3,2,0,3,1],
+    [1,1,1,3,3,3,2,0,1,1],
+    [1,1,3,3,3,3,2,0,1,1],
+    [1,1,1,3,3,1,2,0,1,3],
+    [1,1,1,1,3,1,2,0,1,3],
+    [1,1,1,1,1,1,2,0,1,1],
+    [1,1,1,1,1,1,2,0,1,1],
+], dtype=int)
+
 
 # =========================================================
-# 수학적 최적화
+# 수학 모델
 # =========================================================
 def species_value(area: int, c: float, k: float) -> float:
     if area <= 0:
@@ -52,416 +64,56 @@ def species_value(area: int, c: float, k: float) -> float:
 
 def optimize_allocation(
     matrix: np.ndarray,
-    budget: int,
+    budget_cells: int,
     params: Dict[int, Dict[str, float]],
 ) -> Tuple[Dict[int, int], float]:
+    """
+    목적함수:
+        max Σ c_h A_h^k_h
+
+    제약조건:
+        Σ A_h = budget_cells
+        0 <= A_h <= available_h
+
+    산림, 습지, 초지의 모든 가능한 정수 면적 배분을 비교한다.
+    """
     available = {h: int(np.sum(matrix == h)) for h in (1, 2, 3)}
-    budget = min(max(int(budget), 0), sum(available.values()))
+    usable = sum(available.values())
+    budget_cells = min(max(int(budget_cells), 0), usable)
 
     best_value = -1.0
     best_alloc = {1: 0, 2: 0, 3: 0}
 
-    for forest in range(min(available[1], budget) + 1):
-        remain = budget - forest
-        for wetland in range(min(available[2], remain) + 1):
-            grass = remain - wetland
-
-            if grass < 0 or grass > available[3]:
+    for a1 in range(min(available[1], budget_cells) + 1):
+        remain1 = budget_cells - a1
+        for a2 in range(min(available[2], remain1) + 1):
+            a3 = remain1 - a2
+            if a3 < 0 or a3 > available[3]:
                 continue
 
             value = (
-                species_value(forest, params[1]["c"], params[1]["k"])
-                + species_value(wetland, params[2]["c"], params[2]["k"])
-                + species_value(grass, params[3]["c"], params[3]["k"])
+                species_value(a1, params[1]["c"], params[1]["k"])
+                + species_value(a2, params[2]["c"], params[2]["k"])
+                + species_value(a3, params[3]["c"], params[3]["k"])
             )
 
             if value > best_value:
                 best_value = value
-                best_alloc = {1: forest, 2: wetland, 3: grass}
+                best_alloc = {1: a1, 2: a2, 3: a3}
 
     return best_alloc, best_value
 
 
-def equal_allocation(
-    matrix: np.ndarray,
-    budget: int,
-    params: Dict[int, Dict[str, float]],
-) -> Tuple[Dict[int, int], float]:
-    available = {h: int(np.sum(matrix == h)) for h in (1, 2, 3)}
-    allocation = {1: 0, 2: 0, 3: 0}
-    remaining = budget
-
-    while remaining > 0:
-        changed = False
-        for h in (1, 2, 3):
-            if remaining > 0 and allocation[h] < available[h]:
-                allocation[h] += 1
-                remaining -= 1
-                changed = True
-        if not changed:
-            break
-
-    value = sum(
-        species_value(allocation[h], params[h]["c"], params[h]["k"])
-        for h in (1, 2, 3)
-    )
-    return allocation, value
-
-
 # =========================================================
-# 색상 및 질감 특징 추출
+# 공간 선택
 # =========================================================
-def rgb_to_hsv_array(rgb: np.ndarray) -> np.ndarray:
-    """0~255 RGB 배열을 0~1 HSV로 변환."""
-    rgb01 = np.clip(rgb / 255.0, 0.0, 1.0)
-    r, g, b = rgb01[:, 0], rgb01[:, 1], rgb01[:, 2]
-
-    maxc = np.max(rgb01, axis=1)
-    minc = np.min(rgb01, axis=1)
-    delta = maxc - minc
-
-    hue = np.zeros_like(maxc)
-    nonzero = delta > 1e-8
-
-    mask = nonzero & (maxc == r)
-    hue[mask] = ((g[mask] - b[mask]) / delta[mask]) % 6
-
-    mask = nonzero & (maxc == g)
-    hue[mask] = (b[mask] - r[mask]) / delta[mask] + 2
-
-    mask = nonzero & (maxc == b)
-    hue[mask] = (r[mask] - g[mask]) / delta[mask] + 4
-
-    hue /= 6.0
-    saturation = np.where(maxc > 1e-8, delta / maxc, 0.0)
-    value = maxc
-
-    return np.column_stack([hue, saturation, value])
-
-
-def extract_cell_features(
-    image: Image.Image,
-    rows: int,
-    cols: int,
-) -> Tuple[np.ndarray, List[Tuple[int, int]], np.ndarray]:
-    """
-    셀마다 색상, 식생, 수분, 회색도, 질감, 에지 정보를 추출한다.
-    """
-    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
-    height, width, _ = arr.shape
-
-    features = []
-    positions = []
-    mean_rgbs = []
-
-    for row in range(rows):
-        y0 = int(row * height / rows)
-        y1 = int((row + 1) * height / rows)
-
-        for col in range(cols):
-            x0 = int(col * width / cols)
-            x1 = int((col + 1) * width / cols)
-
-            patch = arr[y0:y1, x0:x1]
-            if patch.size == 0:
-                patch = np.zeros((1, 1, 3), dtype=np.float32)
-
-            flat = patch.reshape(-1, 3)
-            mean_rgb = flat.mean(axis=0)
-            std_rgb = flat.std(axis=0)
-            median_rgb = np.median(flat, axis=0)
-
-            r, g, b = mean_rgb
-            brightness = float(mean_rgb.mean())
-            channel_spread = float(mean_rgb.max() - mean_rgb.min())
-
-            excess_green = float(2 * g - r - b)
-            normalized_green = float(
-                (g - (r + b) / 2.0) / (r + g + b + 1e-6)
-            )
-            blue_dominance = float(
-                (b - (r + g) / 2.0) / (r + g + b + 1e-6)
-            )
-            brown_index = float((r - b) + 0.35 * (r - g))
-
-            # 밝기 질감
-            gray = (
-                0.299 * patch[:, :, 0]
-                + 0.587 * patch[:, :, 1]
-                + 0.114 * patch[:, :, 2]
-            )
-            gray_std = float(gray.std())
-
-            # 인접 픽셀 차이로 단순 에지 강도 계산
-            edge_x = (
-                np.abs(np.diff(gray, axis=1)).mean()
-                if gray.shape[1] > 1 else 0.0
-            )
-            edge_y = (
-                np.abs(np.diff(gray, axis=0)).mean()
-                if gray.shape[0] > 1 else 0.0
-            )
-            edge_strength = float((edge_x + edge_y) / 2.0)
-
-            features.append([
-                *mean_rgb,
-                *std_rgb,
-                *median_rgb,
-                brightness,
-                channel_spread,
-                excess_green,
-                normalized_green,
-                blue_dominance,
-                brown_index,
-                gray_std,
-                edge_strength,
-            ])
-            positions.append((row, col))
-            mean_rgbs.append(mean_rgb)
-
-    features_array = np.asarray(features, dtype=np.float32)
-    hsv = rgb_to_hsv_array(np.asarray(mean_rgbs, dtype=np.float32))
-    features_array = np.column_stack([features_array, hsv])
-
-    return features_array, positions, np.asarray(mean_rgbs)
-
-
-# =========================================================
-# 자동 군집화 및 지형 추정
-# =========================================================
-def detailed_clustering(
-    features: np.ndarray,
-    rows: int,
-    cols: int,
-    n_clusters: int = 8,
-) -> Tuple[np.ndarray, np.ndarray]:
-    scaler = StandardScaler()
-    scaled = scaler.fit_transform(features)
-
-    cluster_count = min(n_clusters, len(features))
-    model = KMeans(
-        n_clusters=cluster_count,
-        random_state=42,
-        n_init=30,
-    )
-    labels = model.fit_predict(scaled)
-
-    return labels.reshape(rows, cols), labels
-
-
-def heuristic_cell_scores(features: np.ndarray) -> np.ndarray:
-    """
-    각 셀에 대해 개발지, 산림, 습지, 초지 점수를 계산한다.
-    입력 특징 배열의 열 순서는 extract_cell_features와 동일하다.
-    """
-    r, g, b = features[:, 0], features[:, 1], features[:, 2]
-    brightness = features[:, 9]
-    spread = features[:, 10]
-    exg = features[:, 11]
-    ng = features[:, 12]
-    blue = features[:, 13]
-    brown = features[:, 14]
-    texture = features[:, 15]
-    edge = features[:, 16]
-    hue, sat, val = features[:, 17], features[:, 18], features[:, 19]
-
-    # 정규화 보조 함수
-    def z(x):
-        std = np.std(x)
-        if std < 1e-8:
-            return np.zeros_like(x)
-        return (x - np.mean(x)) / std
-
-    forest = (
-        1.7 * z(exg)
-        + 1.3 * z(ng)
-        + 0.6 * z(sat)
-        + 0.5 * z(texture)
-        - 0.35 * z(brightness)
-    )
-
-    wetland = (
-        2.0 * z(blue)
-        + 0.9 * z(b)
-        - 0.5 * z(exg)
-        - 0.35 * z(brightness)
-        - 0.25 * z(texture)
-    )
-
-    grass = (
-        1.0 * z(exg)
-        + 0.7 * z(ng)
-        + 0.45 * z(brightness)
-        + 0.35 * z(brown)
-        - 0.55 * z(texture)
-    )
-
-    developed = (
-        1.0 * z(brightness)
-        - 0.9 * z(sat)
-        - 0.9 * z(exg)
-        + 0.8 * z(edge)
-        - 0.35 * z(spread)
-    )
-
-    return np.column_stack([developed, forest, wetland, grass])
-
-
-def map_clusters_to_habitats(
-    cluster_matrix: np.ndarray,
-    cluster_labels: np.ndarray,
-    cell_scores: np.ndarray,
-) -> Tuple[np.ndarray, pd.DataFrame]:
-    """
-    세부 군집별 평균 지형 점수를 계산한 뒤 가장 높은 지형으로 통합한다.
-    """
-    habitat = np.zeros_like(cluster_matrix, dtype=int)
-    summary_rows = []
-
-    for cluster in sorted(np.unique(cluster_labels)):
-        mask = cluster_labels == cluster
-        mean_scores = cell_scores[mask].mean(axis=0)
-        code = int(np.argmax(mean_scores))
-        habitat[cluster_matrix == cluster] = code
-
-        summary_rows.append({
-            "세부 군집": int(cluster),
-            "셀 수": int(mask.sum()),
-            "자동 지형": HABITAT_LABELS[code],
-            "개발지 점수": round(float(mean_scores[0]), 2),
-            "산림 점수": round(float(mean_scores[1]), 2),
-            "습지 점수": round(float(mean_scores[2]), 2),
-            "초지 점수": round(float(mean_scores[3]), 2),
-        })
-
-    return habitat, pd.DataFrame(summary_rows)
-
-
-def spatial_regularization(
-    matrix: np.ndarray,
-    confidence_scores: np.ndarray,
-    passes: int = 2,
-) -> np.ndarray:
-    """
-    주변 8개 셀의 지형과 분류 점수를 함께 고려해 고립 셀을 보정한다.
-    가느다란 물길이 전부 사라지지 않도록 습지는 보수적으로 유지한다.
-    """
-    result = matrix.copy()
-    rows, cols = result.shape
-    score_grid = confidence_scores.reshape(rows, cols, 4)
-
-    for _ in range(passes):
-        updated = result.copy()
-
-        for r in range(rows):
-            for c in range(cols):
-                neighbor_codes = []
-
-                for dr in (-1, 0, 1):
-                    for dc in (-1, 0, 1):
-                        if dr == 0 and dc == 0:
-                            continue
-                        nr, nc = r + dr, c + dc
-                        if 0 <= nr < rows and 0 <= nc < cols:
-                            neighbor_codes.append(int(result[nr, nc]))
-
-                if not neighbor_codes:
-                    continue
-
-                counts = np.bincount(neighbor_codes, minlength=4)
-                current = int(result[r, c])
-                majority = int(np.argmax(counts))
-                current_margin = (
-                    score_grid[r, c, current]
-                    - np.partition(score_grid[r, c], -2)[-2]
-                )
-
-                # 현재 판단이 약하고 주변 8칸 중 5칸 이상이 같은 경우만 변경
-                if (
-                    majority != current
-                    and counts[majority] >= 5
-                    and current_margin < 0.75
-                ):
-                    # 물은 선형 지형일 수 있어 더 강한 조건에서만 변경
-                    if current == 2 and counts[majority] < 7:
-                        continue
-                    updated[r, c] = majority
-
-        result = updated
-
-    return result
-
-
-# =========================================================
-# 대표 셀 기반 사진별 재학습
-# =========================================================
-def parse_cell_list(text: str, rows: int, cols: int) -> List[Tuple[int, int]]:
-    """
-    '1,2; 3,4' 형식. 화면상 행/열 번호는 1부터 시작.
-    """
-    cells = []
-    text = text.strip()
-
-    if not text:
-        return cells
-
-    for item in text.split(";"):
-        parts = item.strip().split(",")
-        if len(parts) != 2:
-            continue
-
-        try:
-            row = int(parts[0].strip()) - 1
-            col = int(parts[1].strip()) - 1
-        except ValueError:
-            continue
-
-        if 0 <= row < rows and 0 <= col < cols:
-            cells.append((row, col))
-
-    return cells
-
-
-def calibrate_classifier(
-    features: np.ndarray,
-    initial_matrix: np.ndarray,
-    samples: Dict[int, List[Tuple[int, int]]],
-) -> np.ndarray:
-    rows, cols = initial_matrix.shape
-    train_x = []
-    train_y = []
-
-    for code, cells in samples.items():
-        for r, c in cells:
-            index = r * cols + c
-            train_x.append(features[index])
-            train_y.append(code)
-
-    # 대표 셀이 너무 적으면 초기 결과 유지
-    if len(set(train_y)) < 2 or len(train_y) < 4:
-        return initial_matrix.copy()
-
-    classifier = RandomForestClassifier(
-        n_estimators=350,
-        max_depth=8,
-        min_samples_leaf=1,
-        class_weight="balanced",
-        random_state=42,
-    )
-    classifier.fit(np.asarray(train_x), np.asarray(train_y))
-    prediction = classifier.predict(features)
-
-    return prediction.reshape(rows, cols)
-
-
-# =========================================================
-# 공간 선택 및 시각화
-# =========================================================
-def neighbors4(r: int, c: int, rows: int, cols: int):
+def neighbors(r: int, c: int, rows: int, cols: int) -> List[Tuple[int, int]]:
+    result = []
     for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
         nr, nc = r + dr, c + dc
         if 0 <= nr < rows and 0 <= nc < cols:
-            yield nr, nc
+            result.append((nr, nc))
+    return result
 
 
 def select_connected_cells(
@@ -478,24 +130,41 @@ def select_connected_cells(
 
     rows, cols = matrix.shape
 
-    def cell_score(cell, selected):
+    def same_neighbor_score(cell: Tuple[int, int]) -> int:
         r, c = cell
-        same_neighbors = sum(
+        return sum(
             matrix[nr, nc] == habitat
-            for nr, nc in neighbors4(r, c, rows, cols)
+            for nr, nc in neighbors(r, c, rows, cols)
         )
-        selected_neighbors = sum(
-            (nr, nc) in selected
-            for nr, nc in neighbors4(r, c, rows, cols)
-        )
-        return 4 * selected_neighbors + same_neighbors
 
-    seed = max(candidates, key=lambda x: cell_score(x, set()))
+    seed = max(candidates, key=same_neighbor_score)
     selected = {seed}
+    frontier = {
+        n for n in neighbors(seed[0], seed[1], rows, cols)
+        if matrix[n[0], n[1]] == habitat
+    }
 
     while len(selected) < count:
-        remaining = [cell for cell in candidates if cell not in selected]
-        selected.add(max(remaining, key=lambda x: cell_score(x, selected)))
+        if frontier:
+            next_cell = max(
+                frontier,
+                key=lambda cell: sum(
+                    n in selected
+                    for n in neighbors(cell[0], cell[1], rows, cols)
+                )
+            )
+            frontier.remove(next_cell)
+        else:
+            remaining = [cell for cell in candidates if cell not in selected]
+            if not remaining:
+                break
+            next_cell = max(remaining, key=same_neighbor_score)
+
+        selected.add(next_cell)
+
+        for n in neighbors(next_cell[0], next_cell[1], rows, cols):
+            if matrix[n[0], n[1]] == habitat and n not in selected:
+                frontier.add(n)
 
     return sorted(selected)
 
@@ -504,20 +173,81 @@ def build_selection_matrix(
     matrix: np.ndarray,
     allocation: Dict[int, int],
 ) -> np.ndarray:
-    selected = np.zeros_like(matrix, dtype=int)
+    selection = np.zeros_like(matrix, dtype=int)
 
     for habitat in (1, 2, 3):
-        for r, c in select_connected_cells(matrix, habitat, allocation[habitat]):
-            selected[r, c] = 1
+        cells = select_connected_cells(
+            matrix,
+            habitat,
+            allocation.get(habitat, 0),
+        )
+        for r, c in cells:
+            selection[r, c] = 1
 
-    return selected
+    return selection
 
 
-def draw_overlay(
+# =========================================================
+# 이미지 분석
+# =========================================================
+def auto_classify_image(
+    image: Image.Image,
+    rows: int,
+    cols: int,
+) -> np.ndarray:
+    """
+    각 셀의 평균 RGB를 이용한 탐구용 단순 분류.
+    실제 AI 위성영상 분류 모델은 아니다.
+    """
+    img = image.convert("RGB")
+    arr = np.asarray(img)
+    height, width, _ = arr.shape
+    matrix = np.zeros((rows, cols), dtype=int)
+
+    for r in range(rows):
+        y0 = int(r * height / rows)
+        y1 = int((r + 1) * height / rows)
+
+        for c in range(cols):
+            x0 = int(c * width / cols)
+            x1 = int((c + 1) * width / cols)
+
+            patch = arr[y0:y1, x0:x1]
+            if patch.size == 0:
+                continue
+
+            red, green, blue = patch.mean(axis=(0, 1))
+            brightness = (red + green + blue) / 3
+            spread = max(red, green, blue) - min(red, green, blue)
+
+            # 물: 청색 성분 우세
+            if blue > green * 1.06 and blue > red * 1.12:
+                code = 2
+
+            # 산림: 녹색 우세 + 지나치게 밝지 않음
+            elif green > red * 1.07 and green > blue * 1.03 and brightness < 175:
+                code = 1
+
+            # 초지·농경지: 비교적 밝은 녹색 또는 황록색
+            elif green >= blue and brightness >= 100 and (red + green) > blue * 1.65:
+                code = 3
+
+            # 개발지·도로: 밝은 회색 또는 색상 차이가 적음
+            elif brightness > 155 or spread < 24:
+                code = 0
+
+            else:
+                code = 1
+
+            matrix[r, c] = code
+
+    return matrix
+
+
+def draw_grid(
     image: Image.Image,
     matrix: np.ndarray,
-    selected: np.ndarray | None = None,
-    show_numbers: bool = False,
+    show_classification: bool = False,
 ) -> Image.Image:
     img = image.convert("RGBA")
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
@@ -527,80 +257,63 @@ def draw_overlay(
     width, height = img.size
 
     for r in range(rows):
+        y0 = int(r * height / rows)
+        y1 = int((r + 1) * height / rows)
+
         for c in range(cols):
             x0 = int(c * width / cols)
             x1 = int((c + 1) * width / cols)
-            y0 = int(r * height / rows)
-            y1 = int((r + 1) * height / rows)
 
-            if selected is None:
+            if show_classification:
                 draw.rectangle(
                     [x0, y0, x1, y1],
                     fill=HABITAT_COLORS[int(matrix[r, c])],
-                )
-            elif selected[r, c] == 1:
-                draw.rectangle(
-                    [x0, y0, x1, y1],
-                    fill=HABITAT_COLORS[int(matrix[r, c])],
-                )
-                draw.rectangle(
-                    [x0, y0, x1, y1],
-                    outline=(0, 0, 0, 235),
-                    width=3,
                 )
 
             draw.rectangle(
                 [x0, y0, x1, y1],
-                outline=(255, 255, 255, 165),
+                outline=(255, 255, 255, 190),
                 width=1,
             )
-
-            if show_numbers and (x1 - x0) >= 35 and (y1 - y0) >= 25:
-                label = f"{r+1},{c+1}"
-                draw.text(
-                    (x0 + 3, y0 + 2),
-                    label,
-                    fill=(255, 255, 255, 235),
-                    stroke_width=1,
-                    stroke_fill=(0, 0, 0, 190),
-                )
 
     return Image.alpha_composite(img, overlay).convert("RGB")
 
 
-def draw_plain_grid(
+def draw_recommendation(
     image: Image.Image,
-    rows: int,
-    cols: int,
-    show_numbers: bool = False,
+    matrix: np.ndarray,
+    selection: np.ndarray,
 ) -> Image.Image:
-    dummy = np.zeros((rows, cols), dtype=int)
     img = image.convert("RGBA")
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay, "RGBA")
 
+    rows, cols = matrix.shape
     width, height = img.size
 
     for r in range(rows):
+        y0 = int(r * height / rows)
+        y1 = int((r + 1) * height / rows)
+
         for c in range(cols):
             x0 = int(c * width / cols)
             x1 = int((c + 1) * width / cols)
-            y0 = int(r * height / rows)
-            y1 = int((r + 1) * height / rows)
 
-            draw.rectangle(
-                [x0, y0, x1, y1],
-                outline=(255, 255, 255, 200),
-                width=1,
-            )
-
-            if show_numbers and (x1 - x0) >= 35 and (y1 - y0) >= 25:
-                draw.text(
-                    (x0 + 3, y0 + 2),
-                    f"{r+1},{c+1}",
-                    fill=(255, 255, 255, 240),
-                    stroke_width=1,
-                    stroke_fill=(0, 0, 0, 190),
+            if selection[r, c] == 1:
+                draw.rectangle(
+                    [x0, y0, x1, y1],
+                    fill=HABITAT_COLORS[int(matrix[r, c])],
+                )
+                draw.rectangle(
+                    [x0, y0, x1, y1],
+                    outline=(0, 0, 0, 230),
+                    width=3,
+                )
+            else:
+                draw.rectangle(
+                    [x0, y0, x1, y1],
+                    outline=(255, 255, 255, 140),
+                    width=1,
                 )
 
     return Image.alpha_composite(img, overlay).convert("RGB")
@@ -609,8 +322,7 @@ def draw_plain_grid(
 def matrix_dataframe(matrix: np.ndarray) -> pd.DataFrame:
     return pd.DataFrame(
         matrix,
-        columns=[f"C{i+1}" for i in range(matrix.shape[1])],
-        index=[f"R{i+1}" for i in range(matrix.shape[0])],
+        columns=[f"C{index + 1}" for index in range(matrix.shape[1])],
     )
 
 
@@ -619,257 +331,179 @@ def dataframe_matrix(df: pd.DataFrame) -> np.ndarray:
     return np.clip(numeric.to_numpy(), 0, 3)
 
 
-def plot_budget_curve(
-    matrix: np.ndarray,
-    params: Dict[int, Dict[str, float]],
-):
-    usable = int(np.sum(matrix != 0))
-    budgets = list(range(1, usable + 1))
-    optimal_values = []
-    equal_values = []
+def make_example_image(matrix: np.ndarray) -> Image.Image:
+    rows, cols = matrix.shape
+    size = 720
+    img = Image.new("RGB", (size, size), "white")
+    draw = ImageDraw.Draw(img)
 
-    for budget in budgets:
-        _, opt = optimize_allocation(matrix, budget, params)
-        _, eq = equal_allocation(matrix, budget, params)
-        optimal_values.append(opt)
-        equal_values.append(eq)
+    base_colors = {
+        0: (200, 200, 200),
+        1: (80, 145, 90),
+        2: (80, 145, 210),
+        3: (205, 185, 100),
+    }
 
-    fig, ax = plt.subplots(figsize=(8, 4.3))
-    ax.plot(budgets, optimal_values, label="Optimal allocation")
-    ax.plot(budgets, equal_values, linestyle="--", label="Equal allocation")
-    ax.set_xlabel("Protected area (cells)")
-    ax.set_ylabel("Expected species")
-    ax.set_title("Protected Area and Expected Species")
-    ax.grid(alpha=0.25)
-    ax.legend()
-    fig.tight_layout()
-    return fig
+    for r in range(rows):
+        for c in range(cols):
+            x0 = int(c * size / cols)
+            x1 = int((c + 1) * size / cols)
+            y0 = int(r * size / rows)
+            y1 = int((r + 1) * size / rows)
+
+            draw.rectangle(
+                [x0, y0, x1, y1],
+                fill=base_colors[int(matrix[r, c])],
+            )
+
+    return img
 
 
 # =========================================================
-# Streamlit 화면
+# 화면 구성
 # =========================================================
-st.title("🌿 보호구역 자동 추천 시스템 5.0")
+st.title("🌿 보호구역 자동 추천 시스템 2.0")
 st.write(
-    "색상·식생·수분·질감 특징과 공간 보정을 결합하여 지형을 분류하고, "
-    "종-면적 관계식에 따라 최적 보호구역을 추천합니다."
+    "지형 사진을 업로드하면 프로그램이 자동으로 격자를 생성하고 "
+    "산림·습지·초지·개발지역을 임시 분류한 뒤, "
+    "종-면적 관계식의 합이 최대가 되는 보호구역을 추천합니다."
 )
 
+st.info(
+    "자동 분류는 평균 색상 기반의 탐구용 보조 기능입니다. "
+    "분류 결과가 틀린 셀은 지형행렬에서 직접 수정할 수 있습니다."
+)
+
+# 1단계: 메인 화면에서 사진 입력
 st.header("1. 지형 사진 입력")
 
-uploaded = st.file_uploader(
-    "항공사진 또는 드론 사진을 업로드하세요.",
-    type=["png", "jpg", "jpeg"],
+input_mode = st.radio(
+    "입력 방법",
+    ["사진 업로드", "발표용 예시 사용"],
+    horizontal=True,
 )
 
-if uploaded is None:
-    st.info("사진을 업로드하면 분석이 시작됩니다.")
-    st.stop()
+if input_mode == "사진 업로드":
+    uploaded = st.file_uploader(
+        "항공사진 또는 드론 사진을 올려 주세요.",
+        type=["png", "jpg", "jpeg"],
+    )
 
-source_image = Image.open(uploaded).convert("RGB")
+    if uploaded is None:
+        st.warning("사진을 먼저 업로드해 주세요.")
+        st.stop()
+
+    source_image = Image.open(uploaded).convert("RGB")
+else:
+    uploaded = None
+    source_image = make_example_image(EXAMPLE_MATRIX)
 
 grid_size = st.slider(
     "격자 크기",
-    min_value=6,
-    max_value=16,
+    min_value=5,
+    max_value=15,
     value=10,
     step=1,
+    help="10을 선택하면 사진을 10×10, 총 100개 셀로 나눕니다.",
 )
 
-detail_clusters = st.slider(
-    "세부 색상 군집 수",
-    min_value=6,
-    max_value=12,
-    value=8,
-    step=1,
-)
-
-spatial_passes = st.slider(
-    "공간 보정 강도",
-    min_value=0,
-    max_value=3,
-    value=1,
-    step=1,
-)
-
-signature = (
-    uploaded.name,
-    uploaded.size,
+# 입력이 변경되었는지 확인하기 위한 키
+file_signature = (
+    uploaded.name if uploaded is not None else "example",
     grid_size,
-    detail_clusters,
-    spatial_passes,
+    source_image.size,
 )
 
-if st.session_state.get("signature") != signature:
-    features, positions, mean_rgbs = extract_cell_features(
-        source_image,
-        grid_size,
-        grid_size,
-    )
+if st.session_state.get("file_signature") != file_signature:
+    st.session_state["file_signature"] = file_signature
 
-    cluster_matrix, cluster_labels = detailed_clustering(
-        features,
-        grid_size,
-        grid_size,
-        detail_clusters,
-    )
-
-    scores = heuristic_cell_scores(features)
-
-    automatic_matrix, cluster_summary = map_clusters_to_habitats(
-        cluster_matrix,
-        cluster_labels,
-        scores,
-    )
-
-    automatic_matrix = spatial_regularization(
-        automatic_matrix,
-        scores,
-        spatial_passes,
-    )
-
-    st.session_state["signature"] = signature
-    st.session_state["features"] = features
-    st.session_state["auto_matrix"] = automatic_matrix
-    st.session_state["cluster_summary"] = cluster_summary
-    st.session_state.pop("selection", None)
-
-features = st.session_state["features"]
-auto_matrix = st.session_state["auto_matrix"]
-cluster_summary = st.session_state["cluster_summary"]
-
-st.header("2. 자동 지형 분류")
-
-preview_cols = st.columns(3)
-
-with preview_cols[0]:
-    st.subheader("원본 사진")
-    st.image(source_image, use_container_width=True)
-
-with preview_cols[1]:
-    st.subheader("격자 번호")
-    st.image(
-        draw_plain_grid(
+    if input_mode == "발표용 예시 사용" and grid_size == 10:
+        initial_matrix = EXAMPLE_MATRIX.copy()
+    else:
+        initial_matrix = auto_classify_image(
             source_image,
             grid_size,
             grid_size,
-            show_numbers=True,
-        ),
-        use_container_width=True,
-    )
+        )
 
-with preview_cols[2]:
-    st.subheader("자동 분류")
+    st.session_state["terrain_matrix"] = initial_matrix
+    st.session_state.pop("selection", None)
+
+# 2단계: 자동 격자와 자동 분류
+st.header("2. 자동 격자 및 지형 분류")
+
+current_matrix = st.session_state["terrain_matrix"]
+
+preview1, preview2 = st.columns(2)
+
+with preview1:
+    st.subheader("원본 사진 + 자동 격자")
     st.image(
-        draw_overlay(source_image, auto_matrix),
+        draw_grid(source_image, current_matrix, show_classification=False),
         use_container_width=True,
     )
 
-st.caption(
-    "회색=개발지역·도로 / 초록=산림 / 파랑=습지·하천 / 노랑=초지·농경지"
-)
-
-with st.expander("세부 군집 분석 보기"):
-    st.dataframe(cluster_summary, use_container_width=True, hide_index=True)
-
-st.header("3. 사진별 빠른 보정")
-
-use_calibration = st.checkbox(
-    "대표 셀을 지정해 이 사진에 맞게 자동 재학습",
-    value=False,
-)
-
-calibrated_matrix = auto_matrix.copy()
-
-if use_calibration:
-    st.write(
-        "격자 번호 그림을 보고 각 지형을 대표하는 셀을 입력하세요. "
-        "형식 예: `1,2; 2,2; 3,4`"
+with preview2:
+    st.subheader("자동 지형 분류 결과")
+    st.image(
+        draw_grid(source_image, current_matrix, show_classification=True),
+        use_container_width=True,
+    )
+    st.caption(
+        "회색=개발지역·도로, 초록=산림, 파랑=습지·하천, 노랑=초지·농경지"
     )
 
-    sample_columns = st.columns(4)
-    samples = {}
-
-    for column, code in zip(sample_columns, range(4)):
-        with column:
-            text = st.text_input(
-                HABITAT_LABELS[code],
-                key=f"sample_{signature}_{code}",
-                placeholder="예: 1,2; 2,2",
-            )
-            samples[code] = parse_cell_list(
-                text,
-                grid_size,
-                grid_size,
-            )
-
-    total_samples = sum(len(v) for v in samples.values())
-
-    if total_samples >= 4:
-        calibrated_matrix = calibrate_classifier(
-            features,
-            auto_matrix,
-            samples,
-        )
-
-        # 대표 셀은 반드시 입력한 지형으로 고정
-        for code, cells in samples.items():
-            for r, c in cells:
-                calibrated_matrix[r, c] = code
-
-        st.subheader("사진별 재학습 결과")
-        st.image(
-            draw_overlay(source_image, calibrated_matrix),
-            use_container_width=True,
-        )
-    else:
-        st.info("서로 다른 지형에서 대표 셀을 합계 4개 이상 입력하면 재학습됩니다.")
-
-st.header("4. 최종 지형행렬 확인")
-
-st.code("0=개발지역·도로, 1=산림, 2=습지·하천, 3=초지·농경지")
+# 3단계: 행렬 수정
+st.header("3. 지형행렬 확인 및 수정")
+st.write("잘못 분류된 셀의 숫자만 고치면 됩니다.")
+st.code("0 = 개발지역·도로 / 1 = 산림 / 2 = 습지·하천 / 3 = 초지·농경지")
 
 edited_df = st.data_editor(
-    matrix_dataframe(calibrated_matrix),
+    matrix_dataframe(current_matrix),
     use_container_width=True,
     num_rows="fixed",
-    key=f"matrix_editor_{signature}_{use_calibration}",
+    key=f"terrain_editor_{file_signature}",
 )
 
 matrix = dataframe_matrix(edited_df)
+st.session_state["terrain_matrix"] = matrix
 
-counts = {code: int(np.sum(matrix == code)) for code in range(4)}
-count_columns = st.columns(4)
-
-for column, code in zip(count_columns, range(4)):
-    column.metric(HABITAT_LABELS[code], f"{counts[code]}칸")
-
-st.header("5. 종-면적 관계식과 최적화")
-
-params = {
-    code: DEFAULT_PARAMS[code].copy()
-    for code in (1, 2, 3)
+counts = {
+    code: int(np.sum(matrix == code))
+    for code in range(4)
 }
 
-st.latex(r"\max S=15A_F^{0.22}+12A_W^{0.35}+8A_G^{0.28}")
-st.latex(r"A_F+A_W+A_G=A_{\mathrm{total}}")
+count_cols = st.columns(4)
+for col, code in zip(count_cols, range(4)):
+    col.metric(HABITAT_LABELS[code], f"{counts[code]}칸")
 
-with st.expander("c, k 값 변경"):
-    parameter_columns = st.columns(3)
+# 4단계: 함수 설정
+st.header("4. 종-면적 함수 설정")
 
-    for column, code in zip(parameter_columns, (1, 2, 3)):
+st.latex(
+    r"S=15A_F^{0.22}+12A_W^{0.35}+8A_G^{0.28}"
+)
+
+with st.expander("c, k 값을 직접 바꾸기", expanded=False):
+    params = {}
+
+    parameter_cols = st.columns(3)
+
+    for column, code in zip(parameter_cols, (1, 2, 3)):
         with column:
             st.subheader(HABITAT_LABELS[code])
-            params[code]["c"] = st.number_input(
-                "c",
+
+            c_value = st.number_input(
+                "c 값",
                 min_value=0.1,
                 max_value=100.0,
                 value=float(DEFAULT_PARAMS[code]["c"]),
                 step=0.1,
                 key=f"c_{code}",
             )
-            params[code]["k"] = st.number_input(
-                "k",
+
+            k_value = st.number_input(
+                "k 값",
                 min_value=0.01,
                 max_value=0.99,
                 value=float(DEFAULT_PARAMS[code]["k"]),
@@ -877,19 +511,34 @@ with st.expander("c, k 값 변경"):
                 key=f"k_{code}",
             )
 
-usable = counts[1] + counts[2] + counts[3]
+            params[code] = {
+                "c": float(c_value),
+                "k": float(k_value),
+            }
 
-if usable == 0:
-    st.error("보호 가능한 자연 지형 셀이 없습니다.")
+if "params" not in locals():
+    params = {
+        code: DEFAULT_PARAMS[code].copy()
+        for code in (1, 2, 3)
+    }
+
+# 5단계: 최적화
+st.header("5. 보호 가능 면적 설정 및 최적화")
+
+usable_cells = counts[1] + counts[2] + counts[3]
+
+if usable_cells == 0:
+    st.error("산림, 습지 또는 초지로 분류된 셀이 없습니다.")
     st.stop()
 
 budget = st.slider(
     "총 보호 가능 면적",
     min_value=1,
-    max_value=usable,
-    value=min(16, usable),
+    max_value=usable_cells,
+    value=min(16, usable_cells),
     step=1,
     format="%d km²",
+    help="셀 1칸을 1 km²로 가정합니다.",
 )
 
 if st.button(
@@ -902,123 +551,157 @@ if st.button(
         budget,
         params,
     )
-    equal_alloc, equal_value = equal_allocation(
-        matrix,
-        budget,
-        params,
-    )
+
     selection = build_selection_matrix(
         matrix,
         allocation,
     )
 
-    st.session_state["selection"] = selection
     st.session_state["allocation"] = allocation
     st.session_state["objective"] = objective
-    st.session_state["equal_value"] = equal_value
+    st.session_state["selection"] = selection
     st.session_state["result_matrix"] = matrix.copy()
     st.session_state["result_image"] = source_image.copy()
-    st.session_state["result_params"] = params.copy()
+    st.session_state["result_params"] = params
 
+# 6단계: 결과
 if "selection" in st.session_state:
     st.divider()
     st.header("6. 최적 보호구역 추천 결과")
 
-    selection = st.session_state["selection"]
     allocation = st.session_state["allocation"]
     objective = st.session_state["objective"]
-    equal_value = st.session_state["equal_value"]
+    selection = st.session_state["selection"]
     result_matrix = st.session_state["result_matrix"]
     result_image = st.session_state["result_image"]
     result_params = st.session_state["result_params"]
 
-    recommendation = draw_overlay(
+    recommendation = draw_recommendation(
         result_image,
         result_matrix,
-        selected=selection,
+        selection,
     )
 
-    gain = objective - equal_value
-    gain_pct = 0 if equal_value <= 0 else gain / equal_value * 100
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("총 보호면적", f"{int(selection.sum())} km²")
+    metric_cols[1].metric("예상 보존 종수", f"{objective:.2f}종")
+    metric_cols[2].metric("습지 배분", f"{allocation[2]} km²")
+    metric_cols[3].metric(
+        "전체 셀 중 선택 비율",
+        f"{selection.sum() / result_matrix.size * 100:.1f}%",
+    )
 
-    metric_columns = st.columns(4)
-    metric_columns[0].metric("총 보호면적", f"{int(selection.sum())} km²")
-    metric_columns[1].metric("예상 보존 종수", f"{objective:.2f}종")
-    metric_columns[2].metric("균등 배분 대비 증가", f"{gain:.2f}종")
-    metric_columns[3].metric("개선율", f"{gain_pct:.1f}%")
+    comparison_cols = st.columns(3)
 
-    result_columns = st.columns(3)
-
-    with result_columns[0]:
-        st.subheader("원본")
+    with comparison_cols[0]:
+        st.subheader("원본 사진")
         st.image(result_image, use_container_width=True)
 
-    with result_columns[1]:
-        st.subheader("최종 지형 분류")
+    with comparison_cols[1]:
+        st.subheader("자동 지형 분류")
         st.image(
-            draw_overlay(result_image, result_matrix),
+            draw_grid(result_image, result_matrix, show_classification=True),
             use_container_width=True,
         )
 
-    with result_columns[2]:
+    with comparison_cols[2]:
         st.subheader("추천 보호구역")
         st.image(recommendation, use_container_width=True)
 
-    rows = []
+    result_rows = []
 
     for code in (1, 2, 3):
         area = allocation[code]
-        value = species_value(
-            area,
-            result_params[code]["c"],
-            result_params[code]["k"],
-        )
-        rows.append({
+        c_value = result_params[code]["c"]
+        k_value = result_params[code]["k"]
+        species = species_value(area, c_value, k_value)
+
+        result_rows.append({
             "지형": HABITAT_LABELS[code],
-            "전체 셀": int(np.sum(result_matrix == code)),
-            "선택 면적": area,
-            "예상 종수": round(value, 2),
+            "존재 셀 수": int(np.sum(result_matrix == code)),
+            "선택 셀 수": area,
+            "보호면적(km²)": area,
+            "c": c_value,
+            "k": k_value,
+            "예상 종수": round(species, 2),
         })
 
+    st.subheader("지형별 최적 배분")
     st.dataframe(
-        pd.DataFrame(rows),
+        pd.DataFrame(result_rows),
         use_container_width=True,
         hide_index=True,
     )
 
-    graph_column, matrix_column = st.columns([1.2, 1])
+    result_left, result_right = st.columns(2)
 
-    with graph_column:
-        fig = plot_budget_curve(
-            result_matrix,
-            result_params,
-        )
-        st.pyplot(fig)
-        plt.close(fig)
-
-    with matrix_column:
+    with result_left:
         st.subheader("선택행렬")
+        st.caption("1 = 보호구역으로 선택, 0 = 선택하지 않음")
         st.dataframe(
             pd.DataFrame(selection),
             use_container_width=True,
             hide_index=True,
         )
 
-    largest = max(allocation, key=allocation.get)
+    with result_right:
+        st.subheader("목적함수 계산")
 
-    st.success(
-        f"총 {budget} km²를 보호할 때 예상 보존 종수는 약 "
-        f"{objective:.2f}종입니다. 가장 많은 면적이 배분된 지형은 "
-        f"{HABITAT_LABELS[largest]}이며, 균등 배분보다 약 "
-        f"{gain_pct:.1f}% 높은 결과가 계산되었습니다."
-    )
+        f_value = species_value(
+            allocation[1],
+            result_params[1]["c"],
+            result_params[1]["k"],
+        )
+        w_value = species_value(
+            allocation[2],
+            result_params[2]["c"],
+            result_params[2]["k"],
+        )
+        g_value = species_value(
+            allocation[3],
+            result_params[3]["c"],
+            result_params[3]["k"],
+        )
 
-    buffer = BytesIO()
-    recommendation.save(buffer, format="PNG")
+        st.latex(
+            rf"A_F={allocation[1]},\quad "
+            rf"A_W={allocation[2]},\quad "
+            rf"A_G={allocation[3]}"
+        )
+        st.latex(
+            rf"S_F\approx {f_value:.2f},\quad "
+            rf"S_W\approx {w_value:.2f},\quad "
+            rf"S_G\approx {g_value:.2f}"
+        )
+        st.latex(
+            rf"S\approx {f_value:.2f}+{w_value:.2f}+{g_value:.2f}"
+            rf"={objective:.2f}"
+        )
+
+    image_buffer = BytesIO()
+    recommendation.save(image_buffer, format="PNG")
 
     st.download_button(
         "추천 결과 이미지 다운로드",
-        data=buffer.getvalue(),
-        file_name="protected_area_recommendation_v5.png",
+        data=image_buffer.getvalue(),
+        file_name="protected_area_recommendation.png",
         mime="image/png",
     )
+
+    with st.expander("모델 해석 및 한계"):
+        st.markdown(
+            """
+            **모델 해석**
+
+            - 프로그램은 산림·습지·초지에 배분할 셀 수의 모든 가능한 정수 조합을 비교합니다.
+            - 종-면적 함수의 합이 가장 큰 배분을 최적해로 선택합니다.
+            - 실제 위치를 표시할 때는 같은 지형의 셀이 최대한 연결되도록 선택합니다.
+
+            **한계**
+
+            - 색상 기반 자동 분류는 실제 토지피복 분류 AI보다 정확도가 낮습니다.
+            - 실제 지역의 \(c\), \(k\) 값은 생태조사 자료로 보정해야 합니다.
+            - 서로 다른 지형에 같은 종이 존재하면 예상 종수를 단순 합산할 때 중복될 수 있습니다.
+            - 실제 정책에서는 토지 비용, 멸종위기종, 생태통로, 서식지 연결성 등을 추가해야 합니다.
+            """
+        )

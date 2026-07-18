@@ -62,40 +62,6 @@ def species_value(area: int, c: float, k: float) -> float:
     return float(c * (area ** k))
 
 
-
-def equal_allocation(
-    matrix: np.ndarray,
-    budget_cells: int,
-    params: Dict[int, Dict[str, float]],
-) -> Tuple[Dict[int, int], float]:
-    """
-    비교 기준: 총 보호면적을 산림·습지·초지에 최대한 균등하게 순환 배분한다.
-    단, 특정 지형의 실제 셀 수를 초과할 수 없다.
-    """
-    available = {h: int(np.sum(matrix == h)) for h in (1, 2, 3)}
-    allocation = {1: 0, 2: 0, 3: 0}
-    remaining = min(int(budget_cells), sum(available.values()))
-
-    while remaining > 0:
-        changed = False
-        for habitat in (1, 2, 3):
-            if remaining > 0 and allocation[habitat] < available[habitat]:
-                allocation[habitat] += 1
-                remaining -= 1
-                changed = True
-        if not changed:
-            break
-
-    value = sum(
-        species_value(
-            allocation[habitat],
-            params[habitat]["c"],
-            params[habitat]["k"],
-        )
-        for habitat in (1, 2, 3)
-    )
-    return allocation, value
-
 def optimize_allocation(
     matrix: np.ndarray,
     budget_cells: int,
@@ -585,6 +551,11 @@ if st.button(
         budget,
         params,
     )
+    equal_alloc, equal_value = equal_allocation(
+        matrix,
+        budget,
+        params,
+    )
 
     selection = build_selection_matrix(
         matrix,
@@ -593,6 +564,8 @@ if st.button(
 
     st.session_state["allocation"] = allocation
     st.session_state["objective"] = objective
+    st.session_state["equal_alloc"] = equal_alloc
+    st.session_state["equal_value"] = equal_value
     st.session_state["selection"] = selection
     st.session_state["result_matrix"] = matrix.copy()
     st.session_state["result_image"] = source_image.copy()
@@ -605,7 +578,15 @@ if "selection" in st.session_state:
 
     allocation = st.session_state["allocation"]
     objective = st.session_state["objective"]
+    equal_alloc = st.session_state["equal_alloc"]
+    equal_value = st.session_state["equal_value"]
     selection = st.session_state["selection"]
+
+    improvement = objective - equal_value
+    improvement_rate = (
+        0.0 if equal_value <= 0
+        else improvement / equal_value * 100
+    )
     result_matrix = st.session_state["result_matrix"]
     result_image = st.session_state["result_image"]
     result_params = st.session_state["result_params"]
@@ -618,12 +599,13 @@ if "selection" in st.session_state:
 
     metric_cols = st.columns(4)
     metric_cols[0].metric("총 보호면적", f"{int(selection.sum())} km²")
-    metric_cols[1].metric("예상 보존 종수", f"{objective:.2f}종")
-    metric_cols[2].metric("습지 배분", f"{allocation[2]} km²")
-    metric_cols[3].metric(
-        "전체 셀 중 선택 비율",
-        f"{selection.sum() / result_matrix.size * 100:.1f}%",
+    metric_cols[1].metric("최적 배분 예상 종수", f"{objective:.2f}종")
+    metric_cols[2].metric(
+        "균등 배분 대비 증가",
+        f"{improvement:.2f}종",
+        delta=f"{improvement_rate:.1f}%",
     )
+    metric_cols[3].metric("균등 배분 예상 종수", f"{equal_value:.2f}종")
 
     comparison_cols = st.columns(3)
 
@@ -665,6 +647,36 @@ if "selection" in st.session_state:
         pd.DataFrame(result_rows),
         use_container_width=True,
         hide_index=True,
+    )
+
+    st.subheader("최적 배분과 균등 배분 비교")
+    allocation_comparison = pd.DataFrame([
+        {
+            "지형": HABITAT_LABELS[1],
+            "최적 배분(km²)": allocation[1],
+            "균등 배분(km²)": equal_alloc[1],
+        },
+        {
+            "지형": HABITAT_LABELS[2],
+            "최적 배분(km²)": allocation[2],
+            "균등 배분(km²)": equal_alloc[2],
+        },
+        {
+            "지형": HABITAT_LABELS[3],
+            "최적 배분(km²)": allocation[3],
+            "균등 배분(km²)": equal_alloc[3],
+        },
+    ])
+    st.dataframe(
+        allocation_comparison,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.success(
+        f"같은 총 보호면적을 균등하게 배분했을 때는 약 "
+        f"{equal_value:.2f}종, 최적화했을 때는 약 {objective:.2f}종으로 "
+        f"{improvement:.2f}종({improvement_rate:.1f}%) 더 많이 보존하는 것으로 계산되었습니다."
     )
 
     result_left, result_right = st.columns(2)
